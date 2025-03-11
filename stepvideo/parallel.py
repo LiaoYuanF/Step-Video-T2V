@@ -1,13 +1,29 @@
 import torch.distributed as dist
 import xfuser
 import torch
+import os
 
 
 def initialize_parall_group(ring_degree, ulysses_degree, tensor_parallel_degree):
-    dist.init_process_group("nccl")
+    # 强制设置当前设备（Ray环境下永远用逻辑ID 0）
+    torch.cuda.set_device(0)
+    
+    # 显式从环境变量获取参数
+    rank = int(os.environ['RANK'])
+    world_size = int(os.environ['WORLD_SIZE'])
+
+    # 初始化进程组（必须显式指定参数）
+    dist.init_process_group(
+        backend="nccl",
+        init_method="env://",
+        world_size=world_size,
+        rank=rank
+    )
+    
+    # 后续初始化必须放在进程组初始化之后
     xfuser.core.distributed.init_distributed_environment(
-        rank=dist.get_rank(), 
-        world_size=dist.get_world_size()
+        rank=rank, 
+        world_size=world_size
     )
     
     xfuser.core.distributed.initialize_model_parallel(
@@ -16,7 +32,10 @@ def initialize_parall_group(ring_degree, ulysses_degree, tensor_parallel_degree)
         ulysses_degree=ulysses_degree,
         tensor_parallel_degree=tensor_parallel_degree,
     )
-    torch.cuda.set_device(dist.get_rank())
+
+    # 二次确认设备设置
+    torch.cuda.set_device(0)  # 关键！不要使用dist.get_rank()
+
 
 def get_parallel_group():
     return xfuser.core.distributed.get_world_group()
