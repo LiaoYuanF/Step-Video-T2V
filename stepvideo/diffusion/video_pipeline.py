@@ -318,5 +318,292 @@ class StepVideoPipeline(DiffusionPipeline):
 
             return StepVideoPipelineOutput(video=video)
         
+class SplitStepVideoPipeline(DiffusionPipeline):
+    r"""
+    Pipeline for text-to-video generation using StepVideo.
 
+    This model inherits from [`DiffusionPipeline`]. Check the superclass documentation for the generic methods
+    implemented for all pipelines (downloading, saving, running on a particular device, etc.).
+
+    Args:
+        transformer ([`StepVideoModel`]):
+            Conditional Transformer to denoise the encoded image latents.
+        scheduler ([`FlowMatchDiscreteScheduler`]):
+            A scheduler to be used in combination with `transformer` to denoise the encoded image latents.
+        vae_url:
+            remote vae server's url.
+        caption_url:
+            remote caption (stepllm and clip) server's url.
+    """
+
+    def __init__(
+            self,
+            transformer: StepVideoModel,
+            scheduler: FlowMatchDiscreteScheduler,
+            vae_url: str = '127.0.0.1',
+            caption_url: str = '127.0.0.1',
+            save_path: str = './results',
+            name_suffix: str = '',
+    ):
+        super().__init__()
+
+        self.register_modules(
+            transformer=transformer,
+            scheduler=scheduler,
+        )
+
+        self.vae_scale_factor_temporal = self.vae.temporal_compression_ratio if getattr(self, "vae", None) else 8
+        self.vae_scale_factor_spatial = self.vae.spatial_compression_ratio if getattr(self, "vae", None) else 16
+        self.video_processor = VideoProcessor()
+
+        self.vae_url = vae_url
+        self.caption_url = caption_url
+        self.setup_api(self.vae_url, self.caption_url)
+
+    def setup_api(self, vae_url, caption_url):
+        self.vae_url = vae_url
+        self.caption_url = caption_url
+        self.caption = call_api_gen(caption_url, 'caption')
+        self.vae = call_api_gen(vae_url, 'vae')
+        return self
+
+    def encode_prompt(
+            self,
+            prompt: str,
+            neg_magic: str = '',
+            pos_magic: str = '',
+    ):
+        device = self._execution_device
+        prompts = [prompt + pos_magic]
+        bs = len(prompts)
+        prompts += [neg_magic] * bs
+
+        data = asyncio.run(self.caption(prompts))
+        prompt_embeds, prompt_attention_mask, clip_embedding = data['y'].to(device), data['y_mask'].to(device), data[
+            'clip_embedding'].to(device)
+
+        return prompt_embeds, clip_embedding, prompt_attention_mask
+
+    def decode_vae(self, samples):
+        samples = asyncio.run(self.vae(samples.cpu()))
+        return samples
+
+    def check_inputs(self, num_frames, width, height):
+        num_frames = max(num_frames // 17 * 17, 1)
+        width = max(width // 16 * 16, 16)
+        height = max(height // 16 * 16, 16)
+        return num_frames, width, height
+
+    def prepare_latents(
+            self,
+            batch_size: int,
+            num_channels_latents: 64,
+            height: int = 544,
+            width: int = 992,
+            num_frames: int = 204,
+            dtype: Optional[torch.dtype] = None,
+            device: Optional[torch.device] = None,
+            generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+            latents: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if latents is not None:
+            return latents.to(device=device, dtype=dtype)
+
+        num_frames, width, height = self.check_inputs(num_frames, width, height)
+        shape = (
+            batch_size,
+            max(num_frames // 17 * 3, 1),
+            num_channels_latents,
+            int(height) // self.vae_scale_factor_spatial,
+            int(width) // self.vae_scale_factor_spatial,
+        )  # b,f,c,h,w
+        if isinstance(generator, list) and len(generator) != batch_size:
+            raise ValueError(
+                f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
+                f" size of {batch_size}. Make sure the batch size matches the length of the generators."
+            )
+
+        if generator is None:
+            generator = torch.Generator(device=self._execution_device)
+
+        latents = torch.randn(shape, generator=generator, device=device, dtype=dtype)
+        return latents
+
+    def encode_inputs(
+            self,
+            prompt: Union[str, List[str]],
+            height: int,
+            width: int,
+            num_frames: int,
+            num_videos_per_prompt: int,
+            device: torch.device,
+            generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+            neg_magic: str = "",
+            pos_magic: str = "",
+    ):
+        """处理文本编码和潜在空间初始化"""
+        # 参数校验和转换
+        if isinstance(prompt, str):
+            batch_size = 1
+        else:
+            batch_size = len(prompt)
+
+        # 文本编码
+        prompt_embeds, prompt_embeds_2, prompt_attention_mask = self.encode_prompt(
+            prompt=prompt,
+            neg_magic=neg_magic,
+            pos_magic=pos_magic,
+        )
+
+        # 类型转换
+        transformer_dtype = self.transformer.dtype
+        prompt_embeds = prompt_embeds.to(transformer_dtype)
+        prompt_attention_mask = prompt_attention_mask.to(transformer_dtype)
+        prompt_embeds_2 = prompt_embeds_2.to(transformer_dtype)
+
+        # 初始化潜在空间
+        num_channels_latents = self.transformer.config.in_channels
+        latents = self.prepare_latents(
+            batch_size * num_videos_per_prompt,
+            num_channels_latents,
+            height,
+            width,
+            num_frames,
+            torch.bfloat16,
+            device,
+            generator,
+            None,
+        )
+
+        return {
+            "prompt_embeds": prompt_embeds,
+            "prompt_embeds_2": prompt_embeds_2,
+            "prompt_attention_mask": prompt_attention_mask,
+            "latents": latents,
+        }
+
+    def diffuse(
+            self,
+            latents: torch.Tensor,
+            prompt_embeds: torch.Tensor,
+            prompt_embeds_2: torch.Tensor,
+            prompt_attention_mask: torch.Tensor,
+            num_inference_steps: int,
+            guidance_scale: float,
+            time_shift: float,
+            device: torch.device,
+    ):
+        """执行扩散过程"""
+        # 准备调度器
+        self.scheduler.set_timesteps(
+            num_inference_steps=num_inference_steps,
+            time_shift=time_shift,
+            device=device
+        )
+
+        # 分类器自由引导
+        do_classifier_free_guidance = guidance_scale > 1.0
+
+        # 扩散循环
+        with self.progress_bar(total=num_inference_steps) as progress_bar:
+            for i, t in enumerate(self.scheduler.timesteps):
+                # 准备模型输入
+                latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                latent_model_input = latent_model_input.to(self.transformer.dtype)
+
+                # 时间步处理
+                timestep = t.expand(latent_model_input.shape[0]).to(latent_model_input.dtype)
+
+                # 噪声预测
+                noise_pred = self.transformer(
+                    hidden_states=latent_model_input,
+                    timestep=timestep,
+                    encoder_hidden_states=prompt_embeds,
+                    encoder_attention_mask=prompt_attention_mask,
+                    encoder_hidden_states_2=prompt_embeds_2,
+                    return_dict=False,
+                )
+
+                # 引导缩放
+                if do_classifier_free_guidance:
+                    noise_pred_text, noise_pred_uncond = noise_pred.chunk(2)
+                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+                # 更新潜在空间
+                latents = self.scheduler.step(
+                    model_output=noise_pred,
+                    timestep=t,
+                    sample=latents
+                )
+
+                progress_bar.update()
+
+        return latents
+
+    def decode_outputs(
+            self,
+            latents: torch.Tensor,
+            output_type: str = "mp4",
+            output_file_name: str = "",
+    ):
+        """解码潜在空间并后处理"""
+        if not output_type == "latent":
+            # VAE解码
+            video = self.decode_vae(latents)
+            # 视频后处理
+            video = self.video_processor.postprocess_video(
+                video,
+                output_file_name=output_file_name,
+                output_type=output_type
+            )
+        else:
+            video = latents
+
+        # 释放资源
+        self.maybe_free_model_hooks()
+        return video
+
+    @torch.inference_mode()
+    def __call__(self, **kwargs):
+        """主调用方法"""
+        # 1. 准备阶段
+        device = self._execution_device
+
+        # 2. 编码阶段
+        encoded = self.encode_inputs(
+            prompt=kwargs.get("prompt"),
+            height=kwargs.get("height", 544),
+            width=kwargs.get("width", 992),
+            num_frames=kwargs.get("num_frames", 204),
+            num_videos_per_prompt=kwargs.get("num_videos_per_prompt", 1),
+            device=device,
+            generator=kwargs.get("generator"),
+            neg_magic=kwargs.get("neg_magic", ""),
+            pos_magic=kwargs.get("pos_magic", ""),
+        )
+
+        # 3. 扩散阶段
+        latents = self.diffuse(
+            latents=encoded["latents"],
+            prompt_embeds=encoded["prompt_embeds"],
+            prompt_embeds_2=encoded["prompt_embeds_2"],
+            prompt_attention_mask=encoded["prompt_attention_mask"],
+            num_inference_steps=kwargs.get("num_inference_steps", 50),
+            guidance_scale=kwargs.get("guidance_scale", 9.0),
+            time_shift=kwargs.get("time_shift", 13.0),
+            device=device
+        )
+
+        # 4. 解码阶段
+        video = self.decode_outputs(
+            latents=latents,
+            output_type=kwargs.get("output_type", "mp4"),
+            output_file_name=kwargs.get("output_file_name", ""),
+        )
+
+        # 5. 返回结果
+        if not kwargs.get("return_dict", True):
+            return (video,)
+
+        return StepVideoPipelineOutput(video=video)
         
