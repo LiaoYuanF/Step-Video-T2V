@@ -1,4 +1,4 @@
-from stepvideo.diffusion.video_pipeline import StepVideoPipeline
+from stepvideo.diffusion.video_pipeline import StepVideoPipeline, SplitStepVideoPipeline
 import torch.distributed as dist
 import torch
 from stepvideo.config import parse_args
@@ -16,7 +16,7 @@ if __name__ == "__main__":
     
     setup_seed(args.seed)
         
-    pipeline = StepVideoPipeline.from_pretrained(args.model_dir).to(dtype=torch.bfloat16, device="cpu")
+    pipeline = SplitStepVideoPipeline.from_pretrained(args.model_dir).to(dtype=torch.bfloat16, device="cpu")
 
     if args.tensor_parallel_degree > 1:
         tp_applicator = TensorParallelApplicator(get_tensor_model_parallel_world_size(), get_tensor_model_parallel_rank())

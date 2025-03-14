@@ -27,13 +27,10 @@ class CaptionPipeline(Resource):
         with torch.no_grad():
             try:
                 y, y_mask = self.text_encoder(prompts)
-
                 clip_embedding, _ = self.clip(prompts)
-
                 len_clip = clip_embedding.shape[1]
                 y_mask = torch.nn.functional.pad(y_mask, (len_clip, 0),
                                                  value=1)  ## pad attention_mask with clip's length
-
                 data = {
                     'y': y.detach().cpu(),
                     'y_mask': y_mask.detach().cpu(),

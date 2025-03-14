@@ -48,3 +48,4 @@ class VideoProcessor:
 
         self.save_imageio_video(video_array, video_path)
         print(f"Saved the generated video in {video_path}")
+        return video_path

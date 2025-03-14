@@ -16,20 +16,20 @@ from stepvideo.utils import VideoProcessor
 
 
 def call_api_gen(url, api, port=8080):
-    url =f"http://{url}:{port}/{api}-api"
+    url = f"http://{url}:{port}/{api}-api"
     import aiohttp
     async def _fn(samples, *args, **kwargs):
-        if api=='vae':
+        if api == 'vae':
             data = {
-                    "samples": samples,
-                }
+                "samples": samples,
+            }
         elif api == 'caption':
             data = {
-                    "prompts": samples,
-                }
+                "prompts": samples,
+            }
         else:
             raise Exception(f"Not supported api: {api}...")
-        
+
         async with aiohttp.ClientSession() as sess:
             data_bytes = pickle.dumps(data)
             async with sess.get(url, data=data_bytes, timeout=12000) as response:
@@ -39,16 +39,14 @@ def call_api_gen(url, api, port=8080):
                     result += chunk
                 response_data = pickle.loads(result)
         return response_data
-        
+
     return _fn
-
-
 
 
 @dataclass
 class StepVideoPipelineOutput(BaseOutput):
     video: Union[torch.Tensor, np.ndarray]
-    
+
 
 class StepVideoPipeline(DiffusionPipeline):
     r"""
@@ -69,13 +67,13 @@ class StepVideoPipeline(DiffusionPipeline):
     """
 
     def __init__(
-        self,
-        transformer: StepVideoModel,
-        scheduler: FlowMatchDiscreteScheduler,
-        vae_url: str = '127.0.0.1',
-        caption_url: str = '127.0.0.1',
-        save_path: str = './results',
-        name_suffix: str = '',
+            self,
+            transformer: StepVideoModel,
+            scheduler: FlowMatchDiscreteScheduler,
+            vae_url: str = '127.0.0.1',
+            caption_url: str = '127.0.0.1',
+            save_path: str = './results',
+            name_suffix: str = '',
     ):
         super().__init__()
 
@@ -83,35 +81,36 @@ class StepVideoPipeline(DiffusionPipeline):
             transformer=transformer,
             scheduler=scheduler,
         )
-        
+
         self.vae_scale_factor_temporal = self.vae.temporal_compression_ratio if getattr(self, "vae", None) else 8
         self.vae_scale_factor_spatial = self.vae.spatial_compression_ratio if getattr(self, "vae", None) else 16
         self.video_processor = VideoProcessor(save_path, name_suffix)
-        
+
         self.vae_url = vae_url
         self.caption_url = caption_url
         self.setup_api(self.vae_url, self.caption_url)
-        
+
     def setup_api(self, vae_url, caption_url):
         self.vae_url = vae_url
         self.caption_url = caption_url
         self.caption = call_api_gen(caption_url, 'caption')
         self.vae = call_api_gen(vae_url, 'vae')
         return self
-    
+
     def encode_prompt(
-        self,
-        prompt: str,
-        neg_magic: str = '',
-        pos_magic: str = '',
+            self,
+            prompt: str,
+            neg_magic: str = '',
+            pos_magic: str = '',
     ):
         device = self._execution_device
-        prompts = [prompt+pos_magic]
+        prompts = [prompt + pos_magic]
         bs = len(prompts)
-        prompts += [neg_magic]*bs
-        
+        prompts += [neg_magic] * bs
+
         data = asyncio.run(self.caption(prompts))
-        prompt_embeds, prompt_attention_mask, clip_embedding = data['y'].to(device), data['y_mask'].to(device), data['clip_embedding'].to(device)
+        prompt_embeds, prompt_attention_mask, clip_embedding = data['y'].to(device), data['y_mask'].to(device), data[
+            'clip_embedding'].to(device)
 
         return prompt_embeds, clip_embedding, prompt_attention_mask
 
@@ -120,22 +119,22 @@ class StepVideoPipeline(DiffusionPipeline):
         return samples
 
     def check_inputs(self, num_frames, width, height):
-        num_frames = max(num_frames//17*17, 1)
-        width = max(width//16*16, 16)
-        height = max(height//16*16, 16)
+        num_frames = max(num_frames // 17 * 17, 1)
+        width = max(width // 16 * 16, 16)
+        height = max(height // 16 * 16, 16)
         return num_frames, width, height
 
     def prepare_latents(
-        self,
-        batch_size: int,
-        num_channels_latents: 64,
-        height: int = 544,
-        width: int = 992,
-        num_frames: int = 204,
-        dtype: Optional[torch.dtype] = None,
-        device: Optional[torch.device] = None,
-        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
-        latents: Optional[torch.Tensor] = None,
+            self,
+            batch_size: int,
+            num_channels_latents: 64,
+            height: int = 544,
+            width: int = 992,
+            num_frames: int = 204,
+            dtype: Optional[torch.dtype] = None,
+            device: Optional[torch.device] = None,
+            generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+            latents: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if latents is not None:
             return latents.to(device=device, dtype=dtype)
@@ -143,11 +142,11 @@ class StepVideoPipeline(DiffusionPipeline):
         num_frames, width, height = self.check_inputs(num_frames, width, height)
         shape = (
             batch_size,
-            max(num_frames//17*3, 1),
+            max(num_frames // 17 * 3, 1),
             num_channels_latents,
             int(height) // self.vae_scale_factor_spatial,
             int(width) // self.vae_scale_factor_spatial,
-        )   # b,f,c,h,w
+        )  # b,f,c,h,w
         if isinstance(generator, list) and len(generator) != batch_size:
             raise ValueError(
                 f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
@@ -160,25 +159,24 @@ class StepVideoPipeline(DiffusionPipeline):
         latents = torch.randn(shape, generator=generator, device=device, dtype=dtype)
         return latents
 
-
     @torch.inference_mode()
     def __call__(
-        self,
-        prompt: Union[str, List[str]] = None,
-        height: int = 544,
-        width: int = 992,
-        num_frames: int = 204,
-        num_inference_steps: int = 50,
-        guidance_scale: float = 9.0,
-        time_shift: float = 13.0,
-        neg_magic: str = "",
-        pos_magic: str = "",
-        num_videos_per_prompt: Optional[int] = 1,
-        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
-        latents: Optional[torch.Tensor] = None,
-        output_type: Optional[str] = "mp4",
-        output_file_name: Optional[str] = "",
-        return_dict: bool = True,
+            self,
+            prompt: Union[str, List[str]] = None,
+            height: int = 544,
+            width: int = 992,
+            num_frames: int = 204,
+            num_inference_steps: int = 50,
+            guidance_scale: float = 9.0,
+            time_shift: float = 13.0,
+            neg_magic: str = "",
+            pos_magic: str = "",
+            num_videos_per_prompt: Optional[int] = 1,
+            generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+            latents: Optional[torch.Tensor] = None,
+            output_type: Optional[str] = "mp4",
+            output_file_name: Optional[str] = "",
+            return_dict: bool = True,
     ):
         r"""
         The call function to the pipeline for generation.
@@ -300,13 +298,14 @@ class StepVideoPipeline(DiffusionPipeline):
                     timestep=t,
                     sample=latents
                 )
-                
+
                 progress_bar.update()
 
-        if not torch.distributed.is_initialized() or int(torch.distributed.get_rank())==0:
+        if not torch.distributed.is_initialized() or int(torch.distributed.get_rank()) == 0:
             if not output_type == "latent":
                 video = self.decode_vae(latents)
-                video = self.video_processor.postprocess_video(video, output_file_name=output_file_name, output_type=output_type)
+                video = self.video_processor.postprocess_video(video, output_file_name=output_file_name,
+                                                               output_type=output_type)
             else:
                 video = latents
 
@@ -454,7 +453,6 @@ class SplitStepVideoPipeline(DiffusionPipeline):
             neg_magic=neg_magic,
             pos_magic=pos_magic,
         )
-
         # 类型转换
         transformer_dtype = self.transformer.dtype
         prompt_embeds = prompt_embeds.to(transformer_dtype)
